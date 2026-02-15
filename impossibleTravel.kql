@@ -1,0 +1,84 @@
+SigninLogs
+| where TimeGenerated >= ago(2h)
+| where IsInteractive == true
+| where toint(ResultType) == 0
+| extend loc = todynamic(LocationDetails)
+| extend
+    Latitude  = todouble(loc.geoCoordinates.latitude),
+    Longitude = todouble(loc.geoCoordinates.longitude),
+    City      = tostring(loc.city),
+    State     = tostring(loc.state),
+    Country   = tostring(loc.countryOrRegion)
+| where isnotnull(Latitude) and isnotnull(Longitude)
+| project
+    TimeGenerated,
+    UserPrincipalName,
+    UserId,
+    IPAddress,
+    AppDisplayName,
+    ClientAppUsed,
+    Latitude,
+    Longitude,
+    City,
+    State,
+    Country,
+    DeviceDetail,
+    AuthenticationDetails,
+    ConditionalAccessStatus,
+    RiskLevelDuringSignIn,
+    RiskDetail,
+    RiskEventTypes_V2,
+    CorrelationId
+| sort by UserPrincipalName asc, TimeGenerated asc
+| serialize
+| extend
+    PrevUser    = prev(UserPrincipalName),
+    PrevTime    = prev(TimeGenerated),
+    PrevLat     = prev(Latitude),
+    PrevLon     = prev(Longitude),
+    PrevCity    = prev(City),
+    PrevState   = prev(State),
+    PrevCountry = prev(Country),
+    PrevIP      = prev(IPAddress),
+    PrevApp     = prev(AppDisplayName),
+    PrevClient  = prev(ClientAppUsed)
+| where UserPrincipalName == PrevUser
+| extend DeltaSeconds = datetime_diff("second", TimeGenerated, PrevTime)
+// High-confidence time window: 2 minutes to 60 minutes
+| where DeltaSeconds between (120 .. 3600)
+// Avoid same-location repeats
+| where Latitude != PrevLat or Longitude != PrevLon
+// Distance in meters using geo_distance_2points [2](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/cost-logs)
+| extend DistanceMeters = geo_distance_2points(PrevLon, PrevLat, Longitude, Latitude)
+| extend DistanceKm = DistanceMeters / 1000.0
+// High-confidence distance floor
+| where DistanceKm >= 800.0
+| extend DeltaHours = DeltaSeconds / 3600.0
+| extend SpeedKmh = DistanceKm / DeltaHours
+// High-confidence speed threshold
+| where SpeedKmh >= 1000.0
+// Max-confidence: require country change (set this line to comment out if you don't want it)
+| where Country != PrevCountry
+// Dedupe: strongest event per user per 15-minute bin
+| summarize arg_max(SpeedKmh, *) by UserPrincipalName, bin(TimeGenerated, 15m)
+| project
+    TimeGenerated,
+    UserPrincipalName,
+    UserId,
+    CurrentIP = IPAddress,
+    PrevIP,
+    CurrentApp = AppDisplayName,
+    PrevApp,
+    CurrentClient = ClientAppUsed,
+    PrevClient,
+    CurrentCity = City, CurrentState = State, CurrentCountry = Country,
+    PrevCity, PrevState, PrevCountry,
+    DistanceKm,
+    DeltaSeconds,
+    SpeedKmh,
+    ConditionalAccessStatus,
+    RiskLevelDuringSignIn,
+    RiskDetail,
+    RiskEventTypes_V2,
+    CorrelationId
+| order by SpeedKmh desc
